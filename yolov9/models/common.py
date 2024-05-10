@@ -10,8 +10,6 @@ from copy import copy
 from pathlib import Path
 from urllib.parse import urlparse
 
-from typing import Optional
-
 import cv2
 import numpy as np
 import pandas as pd
@@ -492,9 +490,8 @@ class SPPF(nn.Module):
 
 
 import torch.nn.functional as F
-from torch.nn.modules.utils import _pair
-    
-    
+
+
 class ReOrg(nn.Module):
     # yolo
     def __init__(self):
@@ -668,7 +665,7 @@ class DetectMultiBackend(nn.Module):
         #   TensorFlow Lite:                *.tflite
         #   TensorFlow Edge TPU:            *_edgetpu.tflite
         #   PaddlePaddle:                   *_paddle_model
-        from models.experimental import attempt_download, attempt_load  # scoped to avoid circular import
+        from yolov9.models import attempt_download, attempt_load  # scoped to avoid circular import
 
         super().__init__()
         w = str(weights[0] if isinstance(weights, list) else weights)
@@ -985,7 +982,7 @@ class AutoShape(nn.Module):
     def _apply(self, fn):
         # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
         self = super()._apply(fn)
-        from models.yolo import Detect, Segment
+        from yolov9.models import Detect, Segment
         if self.pt:
             m = self.model.model.model[-1] if self.dmb else self.model.model[-1]  # Detect()
             if isinstance(m, (Detect, Segment)):

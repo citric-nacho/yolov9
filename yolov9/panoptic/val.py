@@ -16,19 +16,21 @@ if str(ROOT) not in sys.path:
 ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
 import torch.nn.functional as F
-
-from models.common import DetectMultiBackend
-from models.yolo import SegmentationModel
+import torchvision.transforms as transforms
+from pycocotools import mask as maskUtils
+from yolov9.models import DetectMultiBackend
+from yolov9.models import SegmentationModel
 from utils.callbacks import Callbacks
+from utils.coco_utils import getCocoIds, getMappingId, getMappingIndex
 from utils.general import (LOGGER, NUM_THREADS, TQDM_BAR_FORMAT, Profile, check_dataset, check_img_size,
                            check_requirements, check_yaml, coco80_to_coco91_class, colorstr, increment_path,
                            non_max_suppression, print_args, scale_boxes, xywh2xyxy, xyxy2xywh)
 from utils.metrics import ConfusionMatrix, box_iou
 from utils.plots import output_to_target, plot_val_study
-from utils.segment.dataloaders import create_dataloader
-from utils.segment.general import mask_iou, process_mask, process_mask_upsample, scale_image
-from utils.segment.metrics import Metrics, ap_per_class_box_and_mask
-from utils.segment.plots import plot_images_and_masks
+from utils.panoptic.dataloaders import create_dataloader
+from utils.panoptic.general import mask_iou, process_mask, process_mask_upsample, scale_image
+from utils.panoptic.metrics import Metrics, ap_per_class_box_and_mask, Semantic_Metrics
+from utils.panoptic.plots import plot_images_and_masks
 from utils.torch_utils import de_parallel, select_device, smart_inference_mode
 
 
@@ -122,7 +124,7 @@ def run(
         save_hybrid=False,  # save label+prediction hybrid results to *.txt
         save_conf=False,  # save confidences in --save-txt labels
         save_json=False,  # save a COCO-JSON results file
-        project=ROOT / 'runs/val-seg',  # save to project/name
+        project=ROOT / 'runs/val-pan',  # save to project/name
         name='exp',  # save to project/name
         exist_ok=False,  # existing project/name ok, do not increment
         half=True,  # use FP16 half-precision inference
@@ -179,8 +181,13 @@ def run(
     #is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
     is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'val2017.txt')  # COCO dataset
     nc = 1 if single_cls else int(data['nc'])  # number of classes
+    stuff_names = data.get('stuff_names', [])  # names of stuff classes
+    stuff_nc = len(stuff_names)  # number of stuff classes
     iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
     niou = iouv.numel()
+
+    # Semantic Segmentation
+    img_id_list = []
 
     # Dataloader
     if not training:
@@ -209,22 +216,26 @@ def run(
     if isinstance(names, (list, tuple)):  # old format
         names = dict(enumerate(names))
     class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
-    s = ('%22s' + '%11s' * 10) % ('Class', 'Images', 'Instances', 'Box(P', "R", "mAP50", "mAP50-95)", "Mask(P", "R",
-                                  "mAP50", "mAP50-95)")
+    s = ('%22s' + '%11s' * 12) % ('Class', 'Images', 'Instances', 'Box(P', "R", "mAP50", "mAP50-95)", "Mask(P", "R",
+                                  "mAP50", "mAP50-95)", 'S(MIoU', 'FWIoU)')
     dt = Profile(), Profile(), Profile()
     metrics = Metrics()
-    loss = torch.zeros(4, device=device)
+    semantic_metrics = Semantic_Metrics(nc = (nc + stuff_nc), device = device)
+    loss = torch.zeros(6, device=device)
     jdict, stats = [], []
+    semantic_jdict = []
     # callbacks.run('on_val_start')
     pbar = tqdm(dataloader, desc=s, bar_format=TQDM_BAR_FORMAT)  # progress bar
-    for batch_i, (im, targets, paths, shapes, masks) in enumerate(pbar):
+    for batch_i, (im, targets, paths, shapes, masks, semasks) in enumerate(pbar):
         # callbacks.run('on_val_batch_start')
         with dt[0]:
             if cuda:
                 im = im.to(device, non_blocking=True)
                 targets = targets.to(device)
                 masks = masks.to(device)
+                semasks = semasks.to(device)
             masks = masks.float()
+            semasks = semasks.float()
             im = im.half() if half else im.float()  # uint8 to fp16/32
             im /= 255  # 0 - 255 to 0.0 - 1.0
             nb, _, height, width = im.shape  # batch size, channels, height, width
@@ -235,15 +246,16 @@ def run(
             #train_out, preds, protos = p if len(p) == 3 else p[1]
             #preds = p
             #train_out = p[1][0] if len(p[1]) == 3 else p[0]
-            protos = train_out[-1]
+            # protos = train_out[-1]
             #print(preds.shape)
             #print(train_out[0].shape)
             #print(train_out[1].shape)
             #print(train_out[2].shape)
+            _, pred_masks, protos, psemasks = train_out
 
         # Loss
         if compute_loss:
-            loss += compute_loss(train_out, targets, masks)[1]  # box, obj, cls
+            loss += compute_loss(train_out, targets, masks, semasks = semasks)[1]  # box, obj, cls
 
         # NMS
         targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
@@ -260,10 +272,23 @@ def run(
 
         # Metrics
         plot_masks = []  # masks for plotting
-        for si, (pred, proto) in enumerate(zip(preds, protos)):
+        plot_semasks = []  # masks for plotting
+
+        if training:
+            semantic_metrics.update(psemasks, semasks)
+        else:
+            _, _, smh, smw = semasks.shape
+            semantic_metrics.update(torch.nn.functional.interpolate(psemasks, size = (smh, smw), mode = 'bilinear', align_corners = False), semasks)
+
+        if plots and batch_i < 3:
+            plot_semasks.append(psemasks.clone().detach().cpu())
+
+        for si, (pred, proto, psemask) in enumerate(zip(preds, protos, psemasks)):
             labels = targets[targets[:, 0] == si, 1:]
             nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
             path, shape = Path(paths[si]), shapes[si][0]
+            image_id = path.stem
+            img_id_list.append(image_id)
             correct_masks = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             correct_bboxes = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
             seen += 1
@@ -273,49 +298,129 @@ def run(
                     stats.append((correct_masks, correct_bboxes, *torch.zeros((2, 0), device=device), labels[:, 0]))
                     if plots:
                         confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
-                continue
+            else:
+                # Masks
+                midx = [si] if overlap else targets[:, 0] == si
+                gt_masks = masks[midx]
+                pred_masks = process(proto, pred[:, 6:], pred[:, :4], shape=im[si].shape[1:])
 
-            # Masks
-            midx = [si] if overlap else targets[:, 0] == si
-            gt_masks = masks[midx]
-            pred_masks = process(proto, pred[:, 6:], pred[:, :4], shape=im[si].shape[1:])
+                # Predictions
+                if single_cls:
+                    pred[:, 5] = 0
+                predn = pred.clone()
+                scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
 
-            # Predictions
-            if single_cls:
-                pred[:, 5] = 0
-            predn = pred.clone()
-            scale_boxes(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
+                # Evaluate
+                if nl:
+                    tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
+                    scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
+                    labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
+                    correct_bboxes = process_batch(predn, labelsn, iouv)
+                    correct_masks = process_batch(predn, labelsn, iouv, pred_masks, gt_masks, overlap=overlap, masks=True)
+                    if plots:
+                        confusion_matrix.process_batch(predn, labelsn)
+                stats.append((correct_masks, correct_bboxes, pred[:, 4], pred[:, 5], labels[:, 0]))  # (conf, pcls, tcls)
 
-            # Evaluate
-            if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_boxes(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct_bboxes = process_batch(predn, labelsn, iouv)
-                correct_masks = process_batch(predn, labelsn, iouv, pred_masks, gt_masks, overlap=overlap, masks=True)
-                if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct_masks, correct_bboxes, pred[:, 4], pred[:, 5], labels[:, 0]))  # (conf, pcls, tcls)
+                pred_masks = torch.as_tensor(pred_masks, dtype=torch.uint8)
+                if plots and batch_i < 3:
+                    plot_masks.append(pred_masks[:15].cpu())  # filter top 15 to plot
 
-            pred_masks = torch.as_tensor(pred_masks, dtype=torch.uint8)
-            if plots and batch_i < 3:
-                plot_masks.append(pred_masks[:15].cpu())  # filter top 15 to plot
+                # Save/log
+                if save_txt:
+                    save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
+                if save_json:
+                    pred_masks = scale_image(im[si].shape[1:],
+                                            pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(), shape, shapes[si][1])
+                    save_one_json(predn, jdict, path, class_map, pred_masks)  # append to COCO-JSON dictionary
+                # callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
 
-            # Save/log
-            if save_txt:
-                save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
-            if save_json:
-                pred_masks = scale_image(im[si].shape[1:],
-                                         pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(), shape, shapes[si][1])
-                save_one_json(predn, jdict, path, class_map, pred_masks)  # append to COCO-JSON dictionary
-            # callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
+            # Semantic Segmentation
+            h0, w0 = shape
+
+            # resize
+            _, mask_h, mask_w = psemask.shape
+            h_ratio = mask_h / h0
+            w_ratio = mask_w / w0
+
+            if h_ratio == w_ratio:
+                psemask = torch.nn.functional.interpolate(psemask[None, :], size = (h0, w0), mode = 'bilinear', align_corners = False)
+            else:
+                transform = transforms.CenterCrop((h0, w0))
+
+                if (1 != h_ratio) and (1 != w_ratio):
+                    h_new = h0 if (h_ratio < w_ratio) else int(mask_h / w_ratio)
+                    w_new = w0 if (h_ratio > w_ratio) else int(mask_w / h_ratio)
+                    psemask = torch.nn.functional.interpolate(psemask[None, :], size = (h_new, w_new), mode = 'bilinear', align_corners = False)
+
+                psemask = transform(psemask)
+
+            psemask = torch.squeeze(psemask)
+
+            nc, h, w = psemask.shape
+
+            semantic_mask = torch.flatten(psemask, start_dim = 1).permute(1, 0) # class x h x w -> (h x w) x class
+
+            max_idx = semantic_mask.argmax(1)
+            output_masks = torch.zeros(semantic_mask.shape).scatter(1, max_idx.cpu().unsqueeze(1), 1.0) # one hot: (h x w) x class
+            output_masks = torch.reshape(output_masks.permute(1, 0), (nc, h, w)) # (h x w) x class -> class x h x w
+            psemask = output_masks.to(device = device)
+
+            # TODO: check is_coco
+            instances_ids = getCocoIds(name = 'instances')
+            stuff_mask = torch.zeros((h, w), device = device)
+            check_semantic_mask = False
+            for idx, pred_semantic_mask in enumerate(psemask):
+                category_id = int(getMappingId(idx))
+                if 183 == category_id:
+                    # set all non-stuff pixels to other
+                    pred_semantic_mask = (torch.logical_xor(stuff_mask, torch.ones((h, w), device = device))).int()
+
+                # ignore the classes which all zeros / unlabeled class
+                if (0 >= torch.max(pred_semantic_mask)) or (0 >= category_id):
+                    continue
+
+                if category_id not in instances_ids:
+                    # record all stuff mask
+                    stuff_mask = torch.logical_or(stuff_mask, pred_semantic_mask)
+
+                if (category_id not in instances_ids):
+                    rle = maskUtils.encode(np.asfortranarray(pred_semantic_mask.cpu(), dtype = np.uint8))
+                    rle['counts'] = rle['counts'].decode('utf-8')
+
+                    temp_d = {
+                        'image_id': int(image_id) if image_id.isnumeric() else image_id,
+                        'category_id': category_id,
+                        'segmentation': rle,
+                        'score': 1
+                    }
+
+                    semantic_jdict.append(temp_d)
+                    check_semantic_mask = True
+
+            if not check_semantic_mask:
+                # append a other mask for evaluation if the image without any mask
+                other_mask = (torch.ones((h, w), device = device)).int()
+
+                rle = maskUtils.encode(np.asfortranarray(other_mask.cpu(), dtype = np.uint8))
+                rle['counts'] = rle['counts'].decode('utf-8')
+
+                temp_d = {
+                    'image_id': int(image_id) if image_id.isnumeric() else image_id,
+                    'category_id': 183,
+                    'segmentation': rle,
+                    'score': 1
+                }
+
+                semantic_jdict.append(temp_d)
 
         # Plot images
         if plots and batch_i < 3:
             if len(plot_masks):
                 plot_masks = torch.cat(plot_masks, dim=0)
-            plot_images_and_masks(im, targets, masks, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)
-            plot_images_and_masks(im, output_to_target(preds, max_det=15), plot_masks, paths,
+            if len(plot_semasks):
+                plot_semasks = torch.cat(plot_semasks, dim = 0)
+            plot_images_and_masks(im, targets, masks, semasks, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)
+            plot_images_and_masks(im, output_to_target(preds, max_det=15), plot_masks, plot_semasks, paths,
                                   save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
 
         # callbacks.run('on_val_batch_end')
@@ -328,15 +433,15 @@ def run(
     nt = np.bincount(stats[4].astype(int), minlength=nc)  # number of targets per class
 
     # Print results
-    pf = '%22s' + '%11i' * 2 + '%11.3g' * 8  # print format
-    LOGGER.info(pf % ("all", seen, nt.sum(), *metrics.mean_results()))
+    pf = '%22s' + '%11i' * 2 + '%11.3g' * 10  # print format
+    LOGGER.info(pf % ("all", seen, nt.sum(), *metrics.mean_results(), *semantic_metrics.results()))
     if nt.sum() == 0:
         LOGGER.warning(f'WARNING ⚠️ no labels found in {task} set, can not compute metrics without labels')
 
     # Print results per class
     if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
         for i, c in enumerate(metrics.ap_class_index):
-            LOGGER.info(pf % (names[c], seen, nt[c], *metrics.class_result(i)))
+            LOGGER.info(pf % (names[c], seen, nt[c], *metrics.class_result(i), *semantic_metrics.results()))
 
     # Print speeds
     t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
@@ -350,15 +455,24 @@ def run(
     # callbacks.run('on_val_end')
 
     mp_bbox, mr_bbox, map50_bbox, map_bbox, mp_mask, mr_mask, map50_mask, map_mask = metrics.mean_results()
+    miou_sem, fwiou_sem = semantic_metrics.results()
+    semantic_metrics.reset()
 
     # Save JSON
     if save_json and len(jdict):
         w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
+        anno_path = Path(data.get('path', '../coco'))
+        anno_json = str(anno_path / 'annotations/instances_val2017.json')  # annotations json
         pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
         LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
         with open(pred_json, 'w') as f:
             json.dump(jdict, f)
+
+        semantic_anno_json = str(anno_path / 'annotations/stuff_val2017.json')  # annotations json
+        semantic_pred_json = str(save_dir / f"{w}_predictions_stuff.json")  # predictions json
+        LOGGER.info(f'\nsaving {semantic_pred_json}...')
+        with open(semantic_pred_json, 'w') as f:
+            json.dump(semantic_jdict, f)
 
         try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
             from pycocotools.coco import COCO
@@ -375,6 +489,32 @@ def run(
                 eval.summarize()
                 results.extend(eval.stats[:2])  # update results (mAP@0.5:0.95, mAP@0.5)
             map_bbox, map50_bbox, map_mask, map50_mask = results
+
+            # Semantic Segmentation
+            from utils.stuff_seg.cocostuffeval import COCOStuffeval
+
+            LOGGER.info(f'\nEvaluating pycocotools stuff... ')
+            imgIds = [int(x) for x in img_id_list]
+
+            stuffGt = COCO(semantic_anno_json)  # initialize COCO ground truth api
+            stuffDt = stuffGt.loadRes(semantic_pred_json)  # initialize COCO pred api
+
+            cocoStuffEval = COCOStuffeval(stuffGt, stuffDt)
+            cocoStuffEval.params.imgIds = imgIds  # image IDs to evaluate
+            cocoStuffEval.evaluate()
+            stats, statsClass = cocoStuffEval.summarize()
+            stuffIds = getCocoIds(name = 'stuff')
+            title = ' {:<5} | {:^6} | {:^6} '.format('class', 'iou', 'macc') if (0 >= len(stuff_names)) else \
+                    ' {:<5} | {:<20} | {:^6} | {:^6} '.format('class', 'class name', 'iou', 'macc')
+            print(title)
+            for idx, (iou, macc) in enumerate(zip(statsClass['ious'], statsClass['maccs'])):
+                id = (idx + 1)
+                if id not in stuffIds:
+                    continue
+                content = ' {:<5} | {:0.4f} | {:0.4f} '.format(str(id), iou, macc) if (0 >= len(stuff_names)) else \
+                            ' {:<5} | {:<20} | {:0.4f} | {:0.4f} '.format(str(id), str(stuff_names[getMappingIndex(id, name = 'stuff')]), iou, macc)
+                print(content)
+
         except Exception as e:
             LOGGER.info(f'pycocotools unable to run: {e}')
 
@@ -383,14 +523,14 @@ def run(
     if not training:
         s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
         LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
-    final_metric = mp_bbox, mr_bbox, map50_bbox, map_bbox, mp_mask, mr_mask, map50_mask, map_mask
+    final_metric = mp_bbox, mr_bbox, map50_bbox, map_bbox, mp_mask, mr_mask, map50_mask, map_mask, miou_sem, fwiou_sem
     return (*final_metric, *(loss.cpu() / len(dataloader)).tolist()), metrics.get_maps(nc), t
 
 
 def parse_opt():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128-seg.yaml', help='dataset.yaml path')
-    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolo-seg.pt', help='model path(s)')
+    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128-pan.yaml', help='dataset.yaml path')
+    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolo-pan.pt', help='model path(s)')
     parser.add_argument('--batch-size', type=int, default=32, help='batch size')
     parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
     parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
@@ -406,7 +546,7 @@ def parse_opt():
     parser.add_argument('--save-hybrid', action='store_true', help='save label+prediction hybrid results to *.txt')
     parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
     parser.add_argument('--save-json', action='store_true', help='save a COCO-JSON results file')
-    parser.add_argument('--project', default=ROOT / 'runs/val-seg', help='save results to project/name')
+    parser.add_argument('--project', default=ROOT / 'runs/val-pan', help='save results to project/name')
     parser.add_argument('--name', default='exp', help='save to project/name')
     parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
@@ -423,7 +563,7 @@ def main(opt):
     #check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
 
     if opt.task in ('train', 'val', 'test'):  # run normally
-        if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466
+        if opt.conf_thres > 0.001:  # https://github.com/
             LOGGER.warning(f'WARNING ⚠️ confidence threshold {opt.conf_thres} > 0.001 produces invalid results')
         if opt.save_hybrid:
             LOGGER.warning('WARNING ⚠️ --save-hybrid returns high mAP from hybrid labels, not from predictions alone')
